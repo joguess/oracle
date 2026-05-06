@@ -3,12 +3,12 @@
 
 ## 📌 Overview
 
-This repository provides **two productiongrade Bash scripts** to manage **Oracle RMAN backups** and store them securely in **Azure Blob Storage** using **AzCopy with Managed Identity**.
+This repository provides **two production-grade Bash scripts** to manage **Oracle RMAN backups** and store them securely in **Azure Blob Storage** using **AzCopy with Managed Identity**.
 
 The solution covers:
 - **Full & Incremental database backups**
 - **Frequent archivelog backups**
-- **Retentionbased container routing**
+- **Retention-based container routing**
 - **Execution locking**
 - **Recovery Catalog support**
 - **Automatic purge after successful upload**
