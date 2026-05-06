@@ -61,7 +61,7 @@ rman_backup_oracle_azure.sh <ORACLE_SID> <LEVEL:0|1>
 
 ### 2️⃣ rman_archlogs_azcopy.sh
 
-Backs up **Oracle archivelogs**, expected to run every **1015 minutes**.
+Backs up **Oracle archivelogs**, expected to run every **10-15 minutes**.
 
 #### Usage
 
