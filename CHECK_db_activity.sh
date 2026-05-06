@@ -3,6 +3,7 @@
 # Quick multi-instance Oracle activity check (PMON-based or args)
 # Exit codes: 0 ok, 1 partial, 2 fatal
 # Autor : Josselin Joly
+# Output : log file
 
 set -euo pipefail
 
