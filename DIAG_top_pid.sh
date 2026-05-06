@@ -26,6 +26,7 @@
 #   - À lancer sur le nœud où le PID existe (RAC : PID local au nœud)
 #   - Connexion par défaut : "/ as sysdba" (modifiable avec -c)
 #   - Requiert sqlplus dans le PATH et des privilèges catalogue
+#   - Output : one HTML file
 # ======================================================================
 
 set -euo pipefail
