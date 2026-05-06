@@ -23,11 +23,11 @@ usage() {
   cat <<EOF
 Usage: $0 -sid ORACLE_SID [-t SEUIL]
 
-  -sid  SID Oracle (ex: CDBPRD04)                 [OBLIGATOIRE]
-  -t    Seuil du lag (en séquences, défaut: 50)
+  -sid  SID Oracle (ex: CDBDEMO01)        [MANDATORY]
+  -t    Lag threshold (SCN, by default: 50)
 
 Exemple :
-  $0 -sid CDBPRD04 -t 100
+  $0 -sid CDBDEMO01 -t 100
 EOF
   exit 1
 }
