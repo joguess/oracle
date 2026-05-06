@@ -1,5 +1,6 @@
 #!/bin/bash
 #Do not forget to give execute permissions on this shell script: chmod 775 rman_node_check.sh
+# Desc : check if the instance is primary or not understand active or not
 
 #Remark: Because of a shared storage account between the primary and standby nodes I have added the hostname in the log message to indicate which server has logged what
 LogDir=/appli/oracle/backup/$1/log
