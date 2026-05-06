@@ -3,6 +3,7 @@
 # Multi-instance Oracle activity snapshot → HTML report + email attachment
 # Exit codes: 0 ok, 1 partial (some SIDs failed), 2 fatal
 # Autor : Josselin Joly
+# Output : HTML file
 
 set -euo pipefail
 
