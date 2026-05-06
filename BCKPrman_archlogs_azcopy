@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# rman_archlogs_azcopy.sh
+# Sauvegarde des archivelogs (toutes les 15 minutes), upload Azure (container
+# choisi via JSON + rétention DAILY/WEEKLY/MONTHLY/YEARLY), puis purge des
+# archivelogs du filesystem après upload OK.
+#
+# Auteur  : Josselin Joly
+# Usage   : rman_archlogs_azcopy.sh <ORACLE_SID> [--channels N] [--force-log-switch] [--catalog 'user/pwd@tns']
+#
+# Exemples :
+#  rman_archlogs_azcopy.sh CDBDEMO01 --channels 4 --force-log-switch
+#  rman_archlogs_azcopy.sh CDBDEMO01 --catalog 'RMAN_CATALOG/demo_pwd@RMANCAT'
+#
+# Pré-requis :
+#  - azcopy installé (AzcopyBinDirectory=/opt/oracle/tools)
+#  - jq installé
+#  - oraenv disponible
+#  - JSON mapping : /opt/oracle/conf/instances_backup_mapping.json
+#
+# Chemins & conventions :
+#  - BaseBackupDir=/opt/oracle/backup/<SID>/<YYYYMMDD>/<RUN_TS>/
+#  - LogDir=/opt/oracle/log
+#  - Container Azure selon BACKUP (DAILY/WEEKLY/MONTHLY/YEARLY)
+#  - Upload Azure vers:
+#    https://storagedemobackup01.blob.core.windows.net/<container>/<HOST>/<SID>/<YYYYMMDD>/archivelogs/<RUN_TS>/
+# ---------------------------------------------------------------------------
+
+set -o pipefail
+set -u
+
+# ---------- Paramètres d'environnement ----------
+CONF_PATH="/opt/oracle/conf"
+BASE_BACKUP_DIR="/opt/oracle/backup"
+LOG_DIR="/opt/oracle/log"
+AZCOPY_DIR="/opt/oracle/tools"
+RMAN_DIR="/opt/oracle/backup/rman/archivelogs"
+
+JSON_FILE="${CONF_PATH}/instances_backup_mapping.json"
+STORAGE_ACCOUNT="storagedemobackup01"
+
+HOST=${HOSTNAME^^}
+HOST=${HOST%%.*}
+
+# ---------- Arguments ----------
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $(basename "$0") <ORACLE_SID> [--channels N] [--force-log-switch] [--catalog 'user/pwd@tns']"
+  exit 1
+fi
+
+OraInstance="$1"; shift || true
+RMAN_CHANNELS=2
+FORCE_LOG_SWITCH=false
+CATALOG_CONNECT="RMAN_CATALOG/demo_pwd@RMANCAT"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --channels) RMAN_CHANNELS="$2"; shift 2 ;;
+    --force-log-switch) FORCE_LOG_SWITCH=true; shift ;;
+    --catalog) CATALOG_CONNECT="$2"; shift 2 ;;
+    *) echo "Option inconnue: $1"; exit 1 ;;
+  esac
+done
+
+# ---------- Dossiers ----------
+AccountBackupDate="$(date +'%Y%m%d')"
+RUN_TS="$(date +'%H%M')"
+DayDir="${BASE_BACKUP_DIR}/${OraInstance}/${AccountBackupDate}"
+RunDir="${DayDir}/archivelogs/${RUN_TS}"
+RmanLog="${RMAN_DIR}/logs"
+
+mkdir -p "$RunDir" "$RMAN_DIR" "$RmanLog"
+
+LogFile="${LOG_DIR}/$(basename "$0").${OraInstance}_$(date +'%Y%m%d%H%M').log"
+: > "$LogFile"
+
+echo "[INFO] Starting Archivelog Backup: $(date)" >> "$LogFile"
+echo "[INFO] RunDir: $RunDir" >> "$LogFile"
+
+# ---------- Vérifications ----------
+command -v "${AZCOPY_DIR}/azcopy" >/dev/null 2>&1 || exit 1
+command -v jq >/dev/null 2>&1 || exit 1
+command -v oraenv >/dev/null 2>&1 || exit 1
+
+# ---------- Lock ----------
+LOCK_FILE="${RMAN_DIR}/rman_arch_${OraInstance}.lock"
+exec 9>"$LOCK_FILE" || exit 1
+flock -n 9 || exit 0
+trap 'echo "$(date "+%F %T") End job (rc=$?)" >> "$LogFile"' EXIT
+
+# ---------- Rétention ----------
+Get_Retention() {
+  [[ "$(date +%u)" != "7" ]] && BACKUP="DAILY" && return
+  [[ "$(date +%d)" -lt 8 ]] && [[ "$(date +%m)" == "01" ]] && BACKUP="YEARLY" || BACKUP="MONTHLY"
+}
+
+GetArchiveContainer() {
+  result="$(jq --arg name "$OraInstance" -r '.[] | select(.instance_name==$name)' "$JSON_FILE")"
+  case "$BACKUP" in
+    DAILY)   container_location=$(echo "$result" | jq -r '.daily_backup_container') ;;
+    WEEKLY)  container_location=$(echo "$result" | jq -r '.weekly_backup_container') ;;
+    MONTHLY) container_location=$(echo "$result" | jq -r '.monthly_backup_container') ;;
+    YEARLY)  container_location=$(echo "$result" | jq -r '.yearly_backup_container') ;;
+  esac
+}
+
+export ORACLE_SID="$OraInstance"
+export ORAENV_ASK=NO
+. oraenv >>"$LogFile" 2>&1 || exit 1
+
+Get_Retention
+GetArchiveContainer
+
+# ---------- RMAN Backup ----------
+export NLS_DATE_FORMAT='dd/mon/yyyy hh24:mi:ss'
+RMAN_CMD_FILE="${RMAN_DIR}/rman_arch_${OraInstance}.${AccountBackupDate}.rcv"
+
+{
+  echo "RUN {"
+  for i in $(seq 1 "$RMAN_CHANNELS"); do
+    printf "ALLOCATE CHANNEL c%d DEVICE TYPE DISK FORMAT '%s/%%d_%%T_%%U.arc.bkp';\n" "$i" "$RunDir"
+  done
+  echo "BACKUP TAG 'ARCH_${AccountBackupDate}' ARCHIVELOG ALL NOT BACKED UP;"
+  for i in $(seq 1 "$RMAN_CHANNELS"); do echo "RELEASE CHANNEL c$i;"; done
+  echo "}"
+} > "$RMAN_CMD_FILE"
+
+"$ORACLE_HOME/bin/rman" target / catalog "$CATALOG_CONNECT" \
+  cmdfile="$RMAN_CMD_FILE" \
+  log="${RmanLog}/rman_arch_${OraInstance}.${AccountBackupDate}.${RUN_TS}.log"
+
+# ---------- Upload Azure ----------
+"${AZCOPY_DIR}/azcopy" login --identity >>"$LogFile" 2>&1 || exit 1
+
+DEST_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${container_location}/${HOST}/${OraInstance}/${AccountBackupDate}/archivelogs/${RUN_TS}"
+
+"${AZCOPY_DIR}/azcopy" copy "$RunDir/*" "$DEST_URL" --recursive \
+  --overwrite=false --cap-mbps 600 >>"$LogFile" 2>&1 || exit 2
+
+# ---------- Purge ----------
+echo "DELETE NOPROMPT ARCHIVELOG ALL BACKED UP 1 TIMES;" | \
+"$ORACLE_HOME/bin/rman" target / catalog "$CATALOG_CONNECT" >>"$LogFile" 2>&1
+
+echo "[OK] End archivelog backup" >> "$LogFile"
+exit 0
