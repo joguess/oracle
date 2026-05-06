@@ -1,0 +1,34 @@
+[
+    {
+        "instance_name": "CDBDEMO01",
+        "container_name": "app1",
+        "daily_backup_container": "app1-daily",
+        "weekly_backup_container": "app1-weekly",
+        "monthly_backup_container": "app1-monthly",
+        "yearly_backup_container": "app1-yearly"
+    },
+    {
+        "instance_name": "CDBDEMO02",
+        "container_name": "app2",
+        "daily_backup_container": "app2-daily",
+        "weekly_backup_container": "app2-weekly",
+        "monthly_backup_container": "app2-monthly",
+        "yearly_backup_container": "app2-yearly"
+    },
+    {
+        "instance_name": "CDBDEMO03",
+        "container_name": "app3",
+        "daily_backup_container": "app3-daily",
+        "weekly_backup_container": "app3-weekly",
+        "monthly_backup_container": "app3-monthly",
+        "yearly_backup_container": "app3-yearly"
+    },
+    {
+        "instance_name": "CDBDEMO04",
+        "container_name": "app4",
+        "daily_backup_container": "app4-daily",
+        "weekly_backup_container": "app4-weekly",
+        "monthly_backup_container": "app4-monthly",
+        "yearly_backup_container": "app4-yearly"
+    }
+]
