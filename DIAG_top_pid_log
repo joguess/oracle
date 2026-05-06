@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# ======================================================================
+#  diag_top_pid_log.sh — Diagnostic Oracle à partir du PID (top CPU)
+#  Auteur: Josselin Joly
+#  Date  : 25/02/2025
+#  Ce script :
+#   1) Récupère la liste des 20 process les plus consommateurs de CPU :
+#        ps -eo pid,user,%cpu,%mem,args --sort=-%cpu | head -20
+#   2) Prend le PID en tête de liste (1ère ligne après l’en-tête)
+#   3) Lance un SQL embarqué qui :
+#        - Associe PID -> v$process -> v$session
+#        - Affiche SID/SERIAL#/PDB, SQL_ID, CPU, attentes
+#        - Détecte si la session exécute un JOB (DBMS_SCHEDULER/DBMS_JOB)
+#          et affiche le nom du job / de la chaîne / de la tâche
+#        - Affiche le SQL complet (sql_fulltext)
+#        - Affiche le plan d’exécution (DBMS_XPLAN, 'ALLSTATS LAST')
+#        - Gère le cas "background Jxxx sans session" (liste Advisor EXECUTING)
+#
+#  Usage:
+#    ./diag_top_pid_log.sh                # détection auto du PID (top CPU)
+#    ./diag_top_pid_log.sh -p 3010886     # PID imposé
+#    ./diag_top_pid_log.sh -c "/ as sysdba" -o /appli/home/oracle/diag
+#
+#  Notes:
+#   - À lancer sur le nœud où le PID existe (RAC : PID local au nœud)
+#   - Connexion par défaut : "/ as sysdba" (modifiable avec -c)
+#   - Requiert sqlplus dans le PATH et des privilèges catalogue
+#   - Output : one logfile
+# ======================================================================
+set -euo pipefail
+
+print_usage() {
+  cat <<'USAGE'
+Usage:
+  diag_top_pid.sh [-p <PID>] [-c "<connect>"] [-o <outdir>]
+USAGE
+}
+
+PID=""
+CONNECT="/ as sysdba"
+OUTDIR="$(pwd)"
+
+# --- Parse args ---
+while (( "$#" )); do
+  case "$1" in
+    -p) PID="${2:?}"; shift 2 ;;
+    -c) CONNECT="${2:?}"; shift 2 ;;
+    -o) OUTDIR="${2:?}"; shift 2 ;;
+    -h|--help) print_usage; exit 0 ;;
+    *) echo "Unknown option : $1"; exit 1 ;;
+  esac
+done
+
+# --- Capture top 20 CPU ---
+PSLIST="$(ps -eo pid,user,%cpu,%mem,args --sort=-%cpu | head -20)"
+
+if [[ -z "${PID}" ]]; then
+  PID="$(printf "%s\n" "${PSLIST}" | awk 'NR==2{print $1}')"
+  echo "Detected PID : ${PID}"
+fi
+
+# --- Auto-detect ORACLE_SID from ps output (based on PSLIST) ---
+detect_sid() {
+  printf "%s\n" "${PSLIST}" \
+  | awk '
+      NR==1 { next }            # skip header
+      $2!="oracle" { next }     # only processes owned by oracle
+      {
+        for (i=5; i<=NF; i++) {
+          # Pattern 1: oracle<SID>   e.g. oracleCDBNPD07 (LOCAL=NO)
+          if (match($i, /^oracle([A-Za-z0-9_$#]+)/, m)) { print m[1]; exit }
+          # Pattern 2: ora_xxx_<SID> e.g. ora_j000_CDBNPD07
+          if (match($i, /^ora_[^ ]*_([A-Za-z0-9_$#]+)/, m)) { print m[1]; exit }
+        }
+      }
+  '
+}
+
+ORACLE_SID_DET="$(detect_sid || true)"
+if [[ -n "${ORACLE_SID_DET:-}" ]]; then
+  export ORACLE_SID="${ORACLE_SID_DET}"
+  echo "Detected ORACLE_SID : ${ORACLE_SID}"
+else
+  echo "WARNING: ORACLE_SID could not be auto-detected from ps top 20." >&2
+fi
+
+mkdir -p "${OUTDIR}"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUTFILE="${OUTDIR}/diag_${PID}_${TS}.log"
+RUN_DT="$(date '+%Y-%m-%d %H:%M:%S')"
+HOST_N="$(hostname)"
+
+echo "==== Diagnostic start PID=${PID} ===="
+
+# ======================================================================
+#   SQLPlus - UNE SEULE INVOCATION
+# ======================================================================
+
+set +e
+sqlplus -s "${CONNECT}" <<EOF | tee "${OUTFILE}"
+whenever sqlerror continue
+
+SET serveroutput ON SIZE UNLIMITED
+SET echo off verify off feedback off
+SET LINESIZE 32767
+SET LONG 200000
+SET LONGCHUNKSIZE 200000
+SET PAGESIZE 500
+SET TRIMSPOOL ON
+SET WRAP OFF
+COL USERNAME FOR A15
+COL SQL_ID FOR A15
+
+DEFINE pid = '${PID}'
+
+PROMPT
+PROMPT ===================== DIAG BY TOP PID ================================
+PROMPT Date   : `date '+%Y-%m-%d %H:%M:%S'`
+PROMPT Host   : `hostname`
+PROMPT PID    : &pid
+PROMPT Conn   : ${CONNECT}
+PROMPT =====================================================================
+
+VAR v_sid NUMBER
+VAR v_serial NUMBER
+VAR v_con_id NUMBER
+VAR v_is_bg NUMBER
+VAR v_sql_id VARCHAR2(20)
+VAR v_sql_child NUMBER
+VAR v_pdbname VARCHAR2(128)
+
+PROMPT
+PROMPT === Step 1 : Find SID / CON_ID ===
+
+BEGIN
+  :v_sid := NULL;
+  :v_serial := NULL;
+  :v_con_id := NULL;
+  :v_is_bg := 0;
+
+  BEGIN
+    SELECT s.sid, s.serial#, s.con_id,
+           CASE WHEN p.background='YES' THEN 1 ELSE 0 END,
+           s.sql_id, s.sql_child_number
+    INTO   :v_sid, :v_serial, :v_con_id, :v_is_bg,
+           :v_sql_id, :v_sql_child
+    FROM   v\$process p LEFT JOIN v\$session s
+           ON p.addr = s.paddr
+    WHERE  p.spid = &pid;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    :v_is_bg := 1;
+  END;
+END;
+/
+
+PROMPT
+PROMPT ===[1/6] Session + SQL_ID ===
+
+SELECT sid, serial#, username, status, event, sql_id
+FROM   v\$session
+WHERE  sid = :v_sid;
+
+PROMPT
+PROMPT ===[2/6] CPU used ===
+
+SELECT r.value AS cpu_ms
+FROM   v\$sesstat r JOIN v\$statname n USING(statistic#)
+WHERE  n.name='CPU used by this session'
+AND    r.sid=:v_sid;
+
+PROMPT
+PROMPT ===[3/6] Waits ===
+COL WAIT_CLASS FOR A15
+COL EVENT FOR A35
+COL STATE FOR A35
+SELECT event, wait_class, seconds_in_wait, state
+FROM   v\$session
+WHERE  sid=:v_sid;
+
+PROMPT
+PROMPT ===[4/6] FULL SQL ===
+
+DECLARE
+  c CLOB;
+BEGIN
+  BEGIN SELECT sql_fulltext INTO c FROM v\$sql WHERE sql_id=:v_sql_id;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+      BEGIN SELECT sql_fulltext INTO c FROM v\$sqlarea WHERE sql_id=:v_sql_id;
+      EXCEPTION WHEN NO_DATA_FOUND THEN c:=NULL; END;
+  END;
+
+  IF c IS NULL THEN
+    DBMS_OUTPUT.PUT_LINE('No SQL found.');
+  ELSE
+    FOR i IN 0..CEIL(DBMS_LOB.getlength(c)/30000)
+    LOOP DBMS_OUTPUT.PUT_LINE(DBMS_LOB.SUBSTR(c,30000,i*30000+1)); END LOOP;
+  END IF;
+END;
+/
+
+PROMPT
+PROMPT ===[5/6] Checking the plan in V\$SQL_PLAN ===
+
+DECLARE
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*)
+  INTO n
+  FROM v\$sql_plan
+  WHERE sql_id = :v_sql_id
+    AND child_number = :v_sql_child;
+
+  IF n = 0 THEN
+    DBMS_OUTPUT.PUT_LINE(
+     'NOTE: No execution plan found in the cache for SQL_ID='||:v_sql_id||
+     ' (cursor evacuated or never compiled).'
+    );
+  ELSE
+    DBMS_OUTPUT.PUT_LINE(
+      'Execution plan found in cache for SQL_ID=' || :v_sql_id
+    );
+  END IF;
+END;
+/
+
+PROMPT
+PROMPT ===[6/6] EXECUTION PLAN (DBMS_XPLAN) ===
+
+SET LINESIZE 32767
+SET LONG 200000
+SET LONGCHUNKSIZE 200000
+SET WRAP OFF
+SET TRIMSPOOL ON
+COLUMN PLAN_TABLE_OUTPUT FORMAT A32767
+SET PAGESIZE 0
+
+SELECT plan_table_output
+FROM   TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:v_sql_id,:v_sql_child,'ALLSTATS LAST'));
+
+SET PAGESIZE 500
+
+PROMPT ===================== FIN DIAG ================================
+
+EOF
+
+set -e
+
+echo "==== Fin diagnostic → ${OUTFILE}"
+
+# ======================================================================
+#  MAIL — Envoi du fichier HTML généré en pièce jointe
+# ======================================================================
+
+# Paramètres mail (surchargables via variables d'env ou options futures)
+RECIPIENTS="oracle-dba-team@example.local"
+MAIL_FROM="oracle-monitor@example.local"
+MAIL_SUBJECT="${MAIL_SUBJECT:-[Oracle] DIAG by PID ${PID} on ${HOST_N} @ ${RUN_DT}}"
+MAIL_BODY="${MAIL_BODY:-Bonjour,\n\nVeuillez trouver ci-joint le diagnostic HTML généré.\n\nCordialement,\nOracle diag_top_pid.sh}"
+
+send_with_mailx() {
+  # Heirloom/s-nail mailx: -a <attach>; -s <subject>
+  printf "%b" "${MAIL_BODY}" | mailx -r "${MAIL_FROM}" -s "${MAIL_SUBJECT}" -a "${OUTFILE}" "${RECIPIENTS}"
+}
+
+echo "Attempting to send email with attachment: ${OUTFILE}"
+if command -v mailx >/dev/null 2>&1; then
+  if send_with_mailx; then
+    echo "Email sent with mailx to: ${RECIPIENTS}"
+  else
+    echo "WARNING: mailx failed to send the email." >&2
+    exit 1
+  fi
+else
+  echo "ERROR:  'mailx'  found; cannot send email." >&2
+  echo "Generated file remains at: ${OUTFILE}"
+  exit 1
+fi
+
